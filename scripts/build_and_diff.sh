@@ -13,6 +13,7 @@
 #   AARCH64_GCC_URL / ARM32_GCC_URL   gcc 4.9 仓库地址
 #
 # 设计原则：任何一步失败都只记录、不中断，最后一定产出报告。
+# v2：修补 OEM 树缺失的 imgsensor Makefile；make 目标改 vmlinux；AUTO 回退写死已验证 sha。
 set -uo pipefail
 
 WS=/workspace
@@ -76,6 +77,16 @@ else
   step toolchain_verify FAIL "clang 不可执行，编译步骤大概率失败"
 fi
 
+# gcc 4.9 仓库有时不带 aarch64-linux-android-objdump（首跑报 not found，非致命），
+# 用宿主 GNU objdump 建个软链，避免 scripts/mod/mk_elfconfig 再报错。
+if ! command -v aarch64-linux-android-objdump >/dev/null 2>&1; then
+  SYSOBJ=$(command -v objdump || true)
+  if [ -n "$SYSOBJ" ]; then
+    ln -sf "$SYSOBJ" "$TC/aarch64-linux-android-4.9/bin/aarch64-linux-android-objdump"
+    step toolchain_objdump OK "用系统 objdump 补齐"
+  fi
+fi
+
 ###############################################################################
 # 2. 解析 KERNEL_REF（AUTO 用 GitHub API 定位 "Merged realme source into Linux 4.4.146 tag"）
 ###############################################################################
@@ -111,8 +122,10 @@ PY
   if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
     step resolve_ref OK "API 定位到 $REF"
   else
-    step resolve_ref FAIL "API 未找到 4.4.146 提交，改用 git log --grep 回退"
-    REF="__GREP__"
+    # API 常被限流；首跑已用 git log --grep 验证过这个提交就是 4.4.146，直接写死，
+    # 不再回退到 fetch --filter=tree:0（会拖十几分钟）
+    REF="4b8901d9b3e54418c18efc2b9c7b60f5701749d8"
+    step resolve_ref OK "API 未命中，回退到已验证的 4.4.146 提交 $REF"
   fi
 fi
 
@@ -209,18 +222,56 @@ else
   export REAL_CC="$TC/clang-4691093/bin/clang"
   export DTC_EXT=dtc
 
+  # ---- 修补 OEM 开源树裁剪遗漏 ----
+  # 首跑报错：scripts/Makefile.modbuiltin 递归到
+  #   drivers/misc/mediatek/imgsensor/src/mt6771/../common/v1_1/<sensor>/Makefile
+  #   找不到文件直接 Stop。Realme 开源树漏发了几个 sensor 子目录的 Makefile。
+  # 用同目录现成的 Makefile 当模板，把 sensor 名替换掉补齐；不补齐则整个
+  # modules.builtin 目标失败（跟工具链、python2、cust.dtsi 都无关）。
+  COMMON="$SRC/drivers/misc/mediatek/imgsensor/src/common/v1_1"
+  if [ -d "$COMMON" ]; then
+    TPL=$(find "$COMMON" -maxdepth 2 -type f -name Makefile | head -1)
+    TPL_NAME=""
+    [ -n "$TPL" ] && TPL_NAME=$(basename "$(dirname "$TPL")")
+    FIXED=0
+    for d in "$COMMON"/*/; do
+      [ -d "$d" ] || continue
+      [ -f "$d/Makefile" ] && continue
+      NAME=$(basename "$d")
+      if [ -n "$TPL" ]; then
+        sed "s/${TPL_NAME}/${NAME}/g" "$TPL" > "$d/Makefile"
+      else
+        printf 'obj-y := %s.o\n' "$NAME" > "$d/Makefile"
+      fi
+      FIXED=$((FIXED+1))
+    done
+    step patch_imgsensor OK "补全 $FIXED 个缺失的 Makefile（模板：${TPL_NAME:-无}）"
+  else
+    step patch_imgsensor SKIP "源码树没有 imgsensor/common/v1_1，无需修补"
+  fi
+
   if make O="$OUT" olddefconfig >"$LOGS/olddefconfig.log" 2>&1; then
     step olddefconfig OK "以 u60.config 为基线生成 .config"
   else
     step olddefconfig FAIL "见 olddefconfig.log"
   fi
 
-  # CC / REAL_CC 都给：MTK 4.4 的老 Makefile 有的只认 REAL_CC
-  if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" \
+  # CC / REAL_CC 都给：MTK 4.4 的老 Makefile 有的只认 REAL_CC。
+  # 目标只取 vmlinux：默认 all 会先跑 drivers/modules.builtin，
+  # 对裁剪过的 OEM 树很脆弱；vmlinux 链接时 modpost 仍会生成 Module.symvers，
+  # CRC 比对需要的就是它。
+  if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" vmlinux \
        2>&1 | tee "$LOGS/build.log"; then
-    step build OK "编译完成"
+    step build OK "vmlinux 编译完成（已跳过 modules.builtin）"
+    # 再补一个可刷的 Image.gz-dtb；失败不致命，不影响 CRC/符号比对
+    if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" Image.gz-dtb \
+         >>"$LOGS/build.log" 2>&1; then
+      step image_gz_dtb OK "Image.gz-dtb 已生成"
+    else
+      step image_gz_dtb SKIP "Image.gz-dtb 未生成，不影响 CRC / 符号比对"
+    fi
   else
-    step build FAIL "编译失败（常见：工具链版本、DrvGen/py2、缺 cust.dtsi）；build.log 已保留"
+    step build FAIL "vmlinux 编译失败；完整日志见 build.log"
   fi
 
   # 收集产物（有就拷，没有不影响报告）
