@@ -16,6 +16,7 @@
 # v2：修补 imgsensor Makefile；make 目标改 vmlinux；AUTO 回退写死 sha。
 # v3：补齐 aarch64-linux-gnu-* binutils 别名（路径假设错误，见 v4）。
 # v4：全盘 find AOSP binutils 目录，双 triple 软链，apt 兜底。
+# v5：隔离 OPPO 高通残留驱动 + 传 TARGET_PRODUCT=full_oppo6771。
 set -uo pipefail
 
 WS=/workspace
@@ -298,6 +299,9 @@ else
   export CLANG_TRIPLE=aarch64-linux-gnu-
   export REAL_CC="$TC/clang-4691093/bin/clang"
   export DTC_EXT=dtc
+  # 这棵 Realme/OPPO 树的原生产品名。多处 Makefile（尤其 OPPO 安全公共驱动）
+  # 靠它选平台宏；不设会落到高通默认分支去 include <soc/qcom/smem.h>。
+  export TARGET_PRODUCT=full_oppo6771
 
   # ---- 修补 OEM 开源树裁剪遗漏 ----
   # 首跑报错：scripts/Makefile.modbuiltin 递归到
@@ -327,6 +331,24 @@ else
     step patch_imgsensor SKIP "源码树没有 imgsensor/common/v1_1，无需修补"
   fi
 
+  # ---- 隔离 OPPO 高通残留驱动（第四跑失败点）----
+  # drivers/input/Makefile:35 是「无条件」 obj-y += misc/oppo_seccommon_drivers/
+  # 该目录 oppo_secure_common/Makefile 用 TARGET_PRODUCT 选 DEFS_PLATFORM：
+  #   full_oppo6771 -> 6771（MTK 分支，include sec_boot_lib.h）
+  #   其他/未设置   -> 0 -> #else -> #include <soc/qcom/smem.h>
+  # 这是 OPPO 从 msm-4.4 高通树搬过来没清干净的代码，MT6771 树里没有 qcom 头文件，
+  # 第四跑就死在 fatal error: 'soc/qcom/smem.h' file not found。
+  # U60 指纹是 GF3626（mediatek,fingerprint-spi-dev），用不到 OPPO 这套安全公共驱动，
+  # 直接把目录 Makefile 置空最干净：不依赖 sec_boot_lib.h 是否存在，也不改任何 CONFIG。
+  SECCOM="$SRC/drivers/input/misc/oppo_seccommon_drivers/Makefile"
+  if [ -f "$SECCOM" ]; then
+    cp -f "$SECCOM" "$SECCOM.u60bak"
+    printf '# disabled for MT6771 U60: OPPO secure_common is a Qualcomm leftover\n' > "$SECCOM"
+    step patch_oppo_seccommon OK "置空 oppo_seccommon_drivers/Makefile（原文件备份为 .u60bak）"
+  else
+    step patch_oppo_seccommon SKIP "源码树无 oppo_seccommon_drivers/Makefile"
+  fi
+
   if make O="$OUT" olddefconfig >"$LOGS/olddefconfig.log" 2>&1; then
     step olddefconfig OK "以 u60.config 为基线生成 .config"
   else
@@ -337,11 +359,11 @@ else
   # 目标只取 vmlinux：默认 all 会先跑 drivers/modules.builtin，
   # 对裁剪过的 OEM 树很脆弱；vmlinux 链接时 modpost 仍会生成 Module.symvers，
   # CRC 比对需要的就是它。
-  if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" vmlinux \
+  if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" TARGET_PRODUCT=full_oppo6771 vmlinux \
        2>&1 | tee "$LOGS/build.log"; then
     step build OK "vmlinux 编译完成（已跳过 modules.builtin）"
     # 再补一个可刷的 Image.gz-dtb；失败不致命，不影响 CRC/符号比对
-    if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" Image.gz-dtb \
+    if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" TARGET_PRODUCT=full_oppo6771 Image.gz-dtb \
          >>"$LOGS/build.log" 2>&1; then
       step image_gz_dtb OK "Image.gz-dtb 已生成"
     else
