@@ -1,0 +1,33 @@
+# 优学派私有内核符号（来自 kallsyms.txt）
+# 说明：noah=优学派内部项目代号，yxp=优学派缩写；这些是内建进 vmlinux 的原厂改动
+
+0000000000000000 T noah_get_mount_flag
+0000000000000000 t noahdebug_flag_read
+0000000000000000 t noahdebug_flag_write
+0000000000000000 t noahedu_mount_flag_read
+0000000000000000 t noahedu_mount_flag_write
+0000000000000000 T noah_eeprom_getdata
+0000000000000000 T noah_eeprom_readdata
+0000000000000000 T noah_eeprom_setdata
+0000000000000000 T set_noahmic_interlop
+0000000000000000 t noahmic_test_lop
+0000000000000000 t noahmic_work_callback
+0000000000000000 T send_yxp_heaset_event
+0000000000000000 T yxp_usbmic_led_on
+0000000000000000 T yxp_usbmic_led_off
+0000000000000000 T yxp_get_vbus
+0000000000000000 T mt6370_chgdet_handler_yxp
+0000000000000000 T mt6370_enable_chg_type_det_yxp
+0000000000000000 T noahmicusb_work_deal
+0000000000000000 t noahmicusb_work_callback
+0000000000000000 T Open_DSI_clk_yxp
+0000000000000000 T Close_DSI_clk_yxp
+0000000000000000 t noah_private_FG_get_coulomb
+0000000000000000 t noah_private_FG_get_batvol
+0000000000000000 t noah_private_FG_get_hwocv
+0000000000000000 t noah_dbmdx_va_direct_write_store
+0000000000000000 t noah_dbmdx_va_regs_dump_state
+0000000000000000 t noah_dbmdx_param_addr_store
+0000000000000000 t noah_dbmdx_param_show
+0000000000000000 t noah_dbmdx_param_store
+0000000000000000 T AudDrv_yxp_usb_audio_switch

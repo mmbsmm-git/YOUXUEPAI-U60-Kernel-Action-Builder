@@ -1,0 +1,15 @@
+# CI 产物与本机临时文件
+workspace/
+out/
+*.log
+*.tar.gz
+*.img
+*.zip
+!baseline/**
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+*.swp
+__pycache__/
+*.pyc

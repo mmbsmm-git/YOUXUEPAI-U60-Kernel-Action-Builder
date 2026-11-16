@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# 优学派 U60 / P709 —— 内核源码复现 + 取证比对（在 ubuntu:20.04 容器内执行）
+#
+# 路径约定（由 workflow 的 docker run 挂载）：
+#   /repo           只读：本仓库（baseline/ 取证基线、scripts/）
+#   /workspace      可写：工具链、源码树、编译输出、报告
+#
+# 环境变量（由 workflow -e 传入）：
+#   KERNEL_REPO    源码仓库 URL
+#   KERNEL_REF      commit sha / tag / branch，或 AUTO（自动定位 4.4.146 提交）
+#   BUILD_KERNEL   true / false（false 只下载+静态扫描+基线比对，跳过编译）
+#   CLANG_URL      clang-4691093 包地址（可换镜像）
+#   AARCH64_GCC_URL / ARM32_GCC_URL   gcc 4.9 仓库地址
+#
+# 设计原则：任何一步失败都只记录、不中断，最后一定产出报告。
+set -uo pipefail
+
+WS=/workspace
+REPO=/repo
+BASE=$REPO/baseline
+OUT=$WS/out
+SRC=$WS/src/kernel
+TC=$WS/toolchain
+LOGS=$OUT/logs
+mkdir -p "$OUT" "$LOGS" "$TC" "$(dirname "$SRC")"
+
+STATUS=$OUT/steps.tsv
+: > "$STATUS"
+step() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$STATUS"; echo "[$2] $1: $3"; }
+log()  { echo "----- $* -----"; }
+
+echo "=========================================================="
+echo " U60 内核源码复现 | 容器 $(grep -E '^VERSION_ID' /etc/os-release)"
+echo " python2: $(python2 --version 2>&1) | python3: $(python3 --version 2>&1)"
+echo " dtc: $(dtc --version 2>&1 | head -1)"
+echo "=========================================================="
+
+###############################################################################
+# 1. 工具链
+###############################################################################
+log "1/6 下载 AOSP 工具链（版本必须对齐 clang 6.0.2 / r316199 / 4691093）"
+
+CLANG_URL=${CLANG_URL:-"https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/android-9.0.0_r1/clang-4691093.tar.gz"}
+AARCH64_GCC_URL=${AARCH64_GCC_URL:-"https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9"}
+ARM32_GCC_URL=${ARM32_GCC_URL:-"https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9"}
+
+if [ -x "$TC/clang-4691093/bin/clang" ]; then
+  step toolchain_clang OK "已存在，跳过下载"
+else
+  if curl -fL --retry 3 --connect-timeout 30 "$CLANG_URL" -o "$TC/clang-4691093.tar.gz" \
+     && [ -s "$TC/clang-4691093.tar.gz" ]; then
+    mkdir -p "$TC/clang-4691093"
+    tar -xf "$TC/clang-4691093.tar.gz" -C "$TC/clang-4691093"
+    step toolchain_clang OK "下载并解包 $(du -h "$TC/clang-4691093.tar.gz" | cut -f1)"
+  else
+    step toolchain_clang FAIL "clang 包下载失败；在 workflow 输入 CLANG_URL 换镜像后重跑"
+  fi
+fi
+
+clone_gcc() {
+  local name="$1" url="$2" dir="$TC/$1"
+  if compgen -G "$dir/bin/*-gcc" >/dev/null 2>&1; then step "toolchain_$name" OK "已存在"; return; fi
+  if git clone --depth=1 "$url" "$dir" >"$LOGS/${name}_clone.log" 2>&1; then
+    step "toolchain_$name" OK "clone 完成"
+  else
+    step "toolchain_$name" FAIL "clone 失败，见 ${name}_clone.log；可换 GitHub 镜像"
+  fi
+}
+clone_gcc aarch64-linux-android-4.9 "$AARCH64_GCC_URL"
+clone_gcc arm-linux-androideabi-4.9 "$ARM32_GCC_URL"
+
+export PATH="$TC/clang-4691093/bin:$TC/aarch64-linux-android-4.9/bin:$TC/arm-linux-androideabi-4.9/bin:$PATH"
+if "$TC/clang-4691093/bin/clang" -v >"$LOGS/clang_version.txt" 2>&1; then
+  step toolchain_verify OK "$(grep -m1 'clang version' "$LOGS/clang_version.txt")"
+else
+  step toolchain_verify FAIL "clang 不可执行，编译步骤大概率失败"
+fi
+
+###############################################################################
+# 2. 解析 KERNEL_REF（AUTO 用 GitHub API 定位 "Merged realme source into Linux 4.4.146 tag"）
+###############################################################################
+log "2/6 解析源码提交"
+
+KERNEL_REPO=${KERNEL_REPO:-"https://github.com/RMX1831/android_kernel_oppo_mt6771"}
+KERNEL_REF=${KERNEL_REF:-"AUTO"}
+REF="$KERNEL_REF"
+
+if [ "$REF" = "AUTO" ] || [ -z "$REF" ]; then
+  REPO_SLUG=$(echo "$KERNEL_REPO" | sed -E 's#.*github\.com/##; s#\.git$##; s#/$##')
+  export REPO_SLUG
+  log "AUTO: 查询 $REPO_SLUG 的 4.4.146 提交"
+  REF=$(python3 - <<'PY' 2>"$LOGS/ref_api.log" || true
+import json, os, urllib.request
+slug = os.environ.get("REPO_SLUG", "RMX1831/android_kernel_oppo_mt6771")
+url = "https://api.github.com/repos/%s/commits?until=2020-08-05T00:00:00Z&per_page=100" % slug
+req = urllib.request.Request(url, headers={
+    "User-Agent": "u60-kernel-builder",
+    "Accept": "application/vnd.github+json"})
+try:
+    data = json.load(urllib.request.urlopen(req, timeout=40))
+    for c in data:
+        msg = c.get("commit", {}).get("message", "")
+        if "4.4.146" in msg:
+            print(c["sha"])
+            break
+except Exception as e:
+    print("__API_FAIL__", e, file=os.sys.stderr)
+PY
+)
+  REF=$(echo "$REF" | head -1 | tr -d '\r\n ')
+  if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+    step resolve_ref OK "API 定位到 $REF"
+  else
+    step resolve_ref FAIL "API 未找到 4.4.146 提交，改用 git log --grep 回退"
+    REF="__GREP__"
+  fi
+fi
+
+###############################################################################
+# 3. 定点取源码（57 万 commits，绝不能整仓 clone）
+###############################################################################
+log "3/6 取源码树"
+
+if [ -d "$SRC/.git" ]; then
+  step fetch_kernel OK "已存在，跳过"
+else
+  mkdir -p "$SRC" && cd "$SRC"
+  git init -q
+  git remote add origin "$KERNEL_REPO"
+  git config --global user.name "u60-builder"
+  git config --global user.email "u60-builder@local"
+
+  FETCH_OK=0
+  if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+    # 最优：只取这一个提交的树（GitHub 支持按 sha fetch）
+    if git fetch --depth=1 origin "$REF" >"$LOGS/kernel_fetch.log" 2>&1; then
+      git checkout -q FETCH_HEAD
+      FETCH_OK=1
+    fi
+  fi
+
+  if [ "$FETCH_OK" = "0" ]; then
+    # 回退：只拉 commit 元数据（tree:0），再按 message 找 4.4.146
+    log "回退：git fetch --filter=tree:0 拉提交元数据"
+    git fetch --filter=tree:0 origin >"$LOGS/kernel_fetch.log" 2>&1 || \
+      git fetch --depth=200 origin >>"$LOGS/kernel_fetch.log" 2>&1 || true
+    if [ "$REF" = "__GREP__" ]; then
+      REF=$(git log --all --oneline --grep='4.4.146' -1 | awk '{print $1}' | head -1)
+    fi
+    if [ -n "$REF" ] && [ "$REF" != "__GREP__" ]; then
+      git checkout -q "$REF" >>"$LOGS/kernel_fetch.log" 2>&1 || true
+    else
+      git checkout -q FETCH_HEAD >>"$LOGS/kernel_fetch.log" 2>&1 || true
+    fi
+  fi
+
+  if [ -f "$SRC/Makefile" ]; then
+    git log -1 --format='%H%n%ad%n%s' --date=iso > "$LOGS/kernel_head.txt"
+    step fetch_kernel OK "$(git log -1 --format='%h %ad %s' --date=short)"
+  else
+    step fetch_kernel FAIL "未取到完整源码树，见 kernel_fetch.log；可在输入里直接填 KERNEL_REF 的 sha"
+  fi
+  cd "$WS"
+fi
+
+###############################################################################
+# 4. 静态扫描（不需要编译就能判断「这棵树对不对」）
+###############################################################################
+log "4/6 静态扫描：优学派私有符号 / 板级硬件"
+
+if [ -f "$SRC/Makefile" ]; then
+  # 15 个 EXPORT_SYMBOL 私有符号，命中即说明是优学派同源树
+  PAT='noah_get_mount_flag|noah_eeprom_getdata|noah_eeprom_readdata|noah_eeprom_setdata|set_noahmic_interlop|send_yxp_heaset_event|yxp_usbmic_led_on|yxp_usbmic_led_off|yxp_get_vbus|mt6370_chgdet_handler_yxp|mt6370_enable_chg_type_det_yxp|noahmicusb_work_deal|Open_DSI_clk_yxp|Close_DSI_clk_yxp|AudDrv_yxp_usb_audio_switch|buf_handler_register_yxp'
+  grep -rIlE --include='*.c' --include='*.h' --include='*.S' --include='*.dts' --include='*.dtsi' \
+       "$PAT" "$SRC" > "$LOGS/private_symbol_hits.txt" 2>/dev/null || true
+  NHIT=$(wc -l < "$LOGS/private_symbol_hits.txt")
+  step scan_private OK "命中 $NHIT 个文件（0 = 公版 OEM 树，不含优学派补丁）"
+
+  # 板级硬件关键词
+  HPAT='ssd2858|nt35595|HX83102|hx83102|himax|GF3626|gf3626|tfa98xx|dbmd4|it6112|rt9465|mt6370|LN4913|ln4913|ap3220|cs5032|bma250e|cap_touch'
+  grep -rIlE --include='*.c' --include='*.h' --include='*.dts' --include='*.dtsi' \
+       "$HPAT" "$SRC" > "$LOGS/board_hardware_hits.txt" 2>/dev/null || true
+  step scan_board OK "命中 $(wc -l < "$LOGS/board_hardware_hits.txt") 个文件"
+else
+  step scan_private SKIP "无源码树"
+  step scan_board   SKIP "无源码树"
+fi
+
+###############################################################################
+# 5. 编译（用本机抠出的 u60.config 当基线，不用 OEM defconfig）
+###############################################################################
+log "5/6 编译内核"
+
+BUILD_KERNEL=${BUILD_KERNEL:-"true"}
+if [ "$BUILD_KERNEL" != "true" ]; then
+  step build SKIP "BUILD_KERNEL=false，只做下载与静态比对"
+elif [ ! -f "$SRC/Makefile" ]; then
+  step build SKIP "无源码树，跳过编译"
+elif [ ! -x "$TC/clang-4691093/bin/clang" ]; then
+  step build SKIP "clang 缺失，跳过编译"
+else
+  cd "$SRC"
+  mkdir -p "$OUT"
+  cp "$BASE/u60.config" "$OUT/.config"
+  export ARCH=arm64 SUBARCH=arm64
+  export CROSS_COMPILE=aarch64-linux-android-
+  export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+  export CLANG_TRIPLE=aarch64-linux-gnu-
+  export REAL_CC="$TC/clang-4691093/bin/clang"
+  export DTC_EXT=dtc
+
+  if make O="$OUT" olddefconfig >"$LOGS/olddefconfig.log" 2>&1; then
+    step olddefconfig OK "以 u60.config 为基线生成 .config"
+  else
+    step olddefconfig FAIL "见 olddefconfig.log"
+  fi
+
+  # CC / REAL_CC 都给：MTK 4.4 的老 Makefile 有的只认 REAL_CC
+  if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" \
+       2>&1 | tee "$LOGS/build.log"; then
+    step build OK "编译完成"
+  else
+    step build FAIL "编译失败（常见：工具链版本、DrvGen/py2、缺 cust.dtsi）；build.log 已保留"
+  fi
+
+  # 收集产物（有就拷，没有不影响报告）
+  mkdir -p "$OUT/artifacts"
+  for f in "$OUT/vmlinux" "$OUT/Module.symvers" \
+           "$OUT/arch/arm64/boot/Image.gz-dtb" "$OUT/arch/arm64/boot/Image.gz" \
+           "$OUT/.config" "$OUT/include/generated/autoconf.h"; do
+    [ -f "$f" ] && cp -f "$f" "$OUT/artifacts/" 2>/dev/null || true
+  done
+  if [ -f "$OUT/vmlinux" ]; then
+    (nm "$OUT/vmlinux" 2>/dev/null || aarch64-linux-android-nm "$OUT/vmlinux" 2>/dev/null) \
+      | awk '{print $3}' | grep -v '^$' | sort -u > "$OUT/src_syms.txt" || true
+    step nm_symbols OK "$(wc -l < "$OUT/src_syms.txt" 2>/dev/null || echo 0) 个唯一符号"
+  fi
+  cd "$WS"
+fi
+
+###############################################################################
+# 6. 生成比对报告
+###############################################################################
+log "6/6 生成比对报告"
+
+python3 "$REPO/scripts/diff_report.py" \
+  --base "$BASE" --src "$SRC" --out "$OUT" --logs "$LOGS" --status "$STATUS" \
+  > "$LOGS/diff_report.log" 2>&1
+if [ -f "$OUT/U60_源码核对报告.md" ]; then
+  step report OK "U60_源码核对报告.md 已生成"
+else
+  step report FAIL "diff_report.py 失败，见 diff_report.log"
+fi
+
+echo
+echo "=========================================================="
+echo " 步骤汇总"
+echo "=========================================================="
+column -t -s $'\t' "$STATUS" 2>/dev/null || cat "$STATUS"
+echo
+echo "输出目录: $OUT"
+ls -lh "$OUT" | head -30
+echo "=== DONE ==="

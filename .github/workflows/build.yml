@@ -1,0 +1,161 @@
+name: U60 内核源码复现与取证比对
+
+# 流程：AOSP 工具链 → 定点取 4.4.146 内核源码 → 用 u60.config 编译 → 取证比对 → 出报告
+#
+# 为什么用 docker run 而不是 runs-on: ubuntu-20.04：
+#   GitHub 托管的 20.04 runner 已于 2025-04-15 退役，22.04 也在弃用期；
+#   而 MTK DrvGen 需要 python2，只有 focal 的 universe 里还有现成包。
+#   所以：宿主 ubuntu-24.04 + 容器 ubuntu:20.04，依赖首次构建后固化在 GHCR。
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: '内核源码仓库（同 SoC / 4.4.146 同源树）'
+        required: true
+        default: 'https://github.com/RMX1831/android_kernel_oppo_mt6771'
+      KERNEL_REF:
+        description: 'commit sha / tag / branch；AUTO = 自动定位 4.4.146 那次提交'
+        required: true
+        default: 'AUTO'
+      BUILD_KERNEL:
+        description: '是否真的编译内核（false 只做下载+静态扫描+基线比对）'
+        required: true
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+      CLANG_URL:
+        description: 'clang-4691093 包地址（googlesource 不通时换镜像）'
+        required: true
+        default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/android-9.0.0_r1/clang-4691093.tar.gz'
+      UPLOAD_RELEASE:
+        description: '额外发一个 Release（产物同时总是上传 Artifact）'
+        required: true
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+
+jobs:
+  analyze:
+    name: 复现并核对 U60 内核源码
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+      packages: write      # 推 GHCR 预构建镜像
+    env:
+      IMAGE_TAG: u60-kernel-4.4-builder:latest
+
+    steps:
+    - name: 显示运行参数
+      run: |
+        echo "::group::参数"
+        echo "KERNEL_REPO     : ${{ github.event.inputs.KERNEL_REPO }}"
+        echo "KERNEL_REF      : ${{ github.event.inputs.KERNEL_REF }}"
+        echo "BUILD_KERNEL    : ${{ github.event.inputs.BUILD_KERNEL }}"
+        echo "CLANG_URL       : ${{ github.event.inputs.CLANG_URL }}"
+        echo "UPLOAD_RELEASE  : ${{ github.event.inputs.UPLOAD_RELEASE }}"
+        echo "::endgroup::"
+
+    - name: 检出仓库 (Check Out)
+      uses: actions/checkout@v4
+
+    - name: 清理环境（保留 Docker）
+      uses: rokibhasansagar/slimhub_actions@main
+      with:
+        retain: "docker_buildkit,docker_imgcache"
+
+    - name: 初始化工作目录
+      id: pwd
+      run: |
+        mkdir -p workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> "$GITHUB_OUTPUT"
+
+    - name: 设置交换空间 (Swap)
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 12
+
+    # 依赖固化到 GHCR：首次构建并推送，之后直接 pull，跳过 apt。
+    # 若改了 install-deps.sh / Dockerfile，把 env.IMAGE_TAG 换个名字即可重建镜像。
+    - name: 拉取预构建镜像（不存在才构建并固化一次）
+      run: |
+        set -e
+        REPO_LOWER=$(echo "${{ github.repository }}" | tr 'A-Z' 'a-z')
+        IMAGE="ghcr.io/${REPO_LOWER}/${IMAGE_TAG}"
+        echo "Using image: $IMAGE"
+        echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        export DOCKER_BUILDKIT=1
+        if docker pull "$IMAGE"; then
+          echo "使用 GHCR 现成镜像（依赖已固化）: $IMAGE"
+        else
+          echo "GHCR 暂无镜像，构建并推送（仅首次）..."
+          docker build --cache-from "$IMAGE" -t "$IMAGE" -f Dockerfile .
+          docker push "$IMAGE"
+          echo "镜像已固化到 GHCR: $IMAGE"
+        fi
+
+    # /repo 只读放基线数据，/workspace 可写放工具链、源码、输出。
+    # 主逻辑放在 scripts/build_and_diff.sh，避免 YAML 里塞大段引号嵌套。
+    - name: 容器内下载 / 编译 / 比对
+      run: |
+        set -e
+        WS="${{ steps.pwd.outputs.workspace-folder }}"
+        docker run --rm \
+          -v "$WS:/workspace" \
+          -v "${{ github.workspace }}:/repo:ro" \
+          -e KERNEL_REPO="${{ github.event.inputs.KERNEL_REPO }}" \
+          -e KERNEL_REF="${{ github.event.inputs.KERNEL_REF }}" \
+          -e BUILD_KERNEL="${{ github.event.inputs.BUILD_KERNEL }}" \
+          -e CLANG_URL="${{ github.event.inputs.CLANG_URL }}" \
+          "$IMAGE" bash -e -c 'bash /repo/scripts/build_and_diff.sh'
+
+    - name: 写入 Step Summary
+      if: always()
+      run: |
+        SUM="${{ steps.pwd.outputs.workspace-folder }}/out/summary.md"
+        if [ -f "$SUM" ]; then
+          cat "$SUM" >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "## U60 内核源码核对" >> "$GITHUB_STEP_SUMMARY"
+          echo "报告未生成，请查看上方日志与 Artifact。" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: 上传报告与日志 (Artifact)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: u60-kernel-report-${{ github.run_id }}
+        retention-days: 30
+        if-no-files-found: warn
+        path: |
+          ${{ steps.pwd.outputs.workspace-folder }}/out/U60_源码核对报告.md
+          ${{ steps.pwd.outputs.workspace-folder }}/out/summary.md
+          ${{ steps.pwd.outputs.workspace-folder }}/out/summary.json
+          ${{ steps.pwd.outputs.workspace-folder }}/out/steps.tsv
+          ${{ steps.pwd.outputs.workspace-folder }}/out/src_syms.txt
+          ${{ steps.pwd.outputs.workspace-folder }}/out/Module.symvers
+          ${{ steps.pwd.outputs.workspace-folder }}/out/artifacts/.config
+          ${{ steps.pwd.outputs.workspace-folder }}/out/artifacts/Image.gz-dtb
+          ${{ steps.pwd.outputs.workspace-folder }}/out/artifacts/Image.gz
+          ${{ steps.pwd.outputs.workspace-folder }}/out/artifacts/autoconf.h
+          ${{ steps.pwd.outputs.workspace-folder }}/out/logs/
+
+    - name: 额外发 Release（可选）
+      if: ${{ github.event.inputs.UPLOAD_RELEASE == 'true' }}
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.pwd.outputs.workspace-folder }}/out/U60_源码核对报告.md
+          ${{ steps.pwd.outputs.workspace-folder }}/out/artifacts/Image.gz-dtb
+        name: U60-kernel-${{ github.run_id }}
+        tag_name: u60-kernel-${{ github.run_id }}
+        body: |
+          Kernel repo: ${{ github.event.inputs.KERNEL_REPO }}
+          Ref: ${{ github.event.inputs.KERNEL_REF }}
+          完整日志与比对结果见同次运行的 Artifact。
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
