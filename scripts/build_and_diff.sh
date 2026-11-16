@@ -17,6 +17,7 @@
 # v3：补齐 aarch64-linux-gnu-* binutils 别名（路径假设错误，见 v4）。
 # v4：全盘 find AOSP binutils 目录，双 triple 软链，apt 兜底。
 # v5：隔离 OPPO 高通残留驱动 + 传 TARGET_PRODUCT=full_oppo6771。
+# v6：改为从 drivers/input/Makefile 摘除目录引用（置空子 Makefile 会缺 built-in.o）。
 set -uo pipefail
 
 WS=/workspace
@@ -331,22 +332,51 @@ else
     step patch_imgsensor SKIP "源码树没有 imgsensor/common/v1_1，无需修补"
   fi
 
-  # ---- 隔离 OPPO 高通残留驱动（第四跑失败点）----
-  # drivers/input/Makefile:35 是「无条件」 obj-y += misc/oppo_seccommon_drivers/
-  # 该目录 oppo_secure_common/Makefile 用 TARGET_PRODUCT 选 DEFS_PLATFORM：
-  #   full_oppo6771 -> 6771（MTK 分支，include sec_boot_lib.h）
-  #   其他/未设置   -> 0 -> #else -> #include <soc/qcom/smem.h>
-  # 这是 OPPO 从 msm-4.4 高通树搬过来没清干净的代码，MT6771 树里没有 qcom 头文件，
-  # 第四跑就死在 fatal error: 'soc/qcom/smem.h' file not found。
-  # U60 指纹是 GF3626（mediatek,fingerprint-spi-dev），用不到 OPPO 这套安全公共驱动，
-  # 直接把目录 Makefile 置空最干净：不依赖 sec_boot_lib.h 是否存在，也不改任何 CONFIG。
-  SECCOM="$SRC/drivers/input/misc/oppo_seccommon_drivers/Makefile"
-  if [ -f "$SECCOM" ]; then
-    cp -f "$SECCOM" "$SECCOM.u60bak"
-    printf '# disabled for MT6771 U60: OPPO secure_common is a Qualcomm leftover\n' > "$SECCOM"
-    step patch_oppo_seccommon OK "置空 oppo_seccommon_drivers/Makefile（原文件备份为 .u60bak）"
+  # ---- 摘除 OPPO 高通残留驱动（v6：改上层，不再置空子 Makefile）----
+  #
+  # 第四跑：fatal error: 'soc/qcom/smem.h' file not found
+  #   drivers/input/Makefile:35 无条件 obj-y += misc/oppo_seccommon_drivers/
+  #   （#ifdef VENDOR_EDIT 在 Makefile 里只是注释，这行一直生效）
+  #   该目录 oppo_secure_common/Makefile 靠 TARGET_PRODUCT 选平台宏，
+  #   未设置时落高通 #else 分支，MT6771 树里没有 qcom 头文件。
+  #
+  # 第五跑：v5 把子目录 Makefile 置空 -> 上层仍把该目录当 obj-y 的一部分，
+  #   kbuild 会把 "misc/oppo_seccommon_drivers/" 展开成 ".../built-in.o"
+  #   并作为 drivers/input/built-in.o 的输入；空 Makefile 不产出 built-in.o，
+  #   于是链接报：
+  #     aarch64-linux-android-ld: cannot find
+  #       drivers/input/misc/oppo_seccommon_drivers/built-in.o
+  #
+  # v6 正解：直接注释掉 drivers/input/Makefile 那一行。
+  #   上层 obj-y 里没有该目录 -> 不期待 built-in.o，也不再递归进去，
+  #   qcom/smem.h 和 built-in.o 两个问题一起消失。
+  #   子目录 Makefile 恢复原样（清掉 v5 的置空痕迹），保持源码树干净。
+  #
+  # U60 指纹是 GF3626（mediatek,fingerprint-spi-dev），用不到这套 OPPO
+  # 安全公共驱动；不改任何 CONFIG，配置 diff 报告照常如实反映。
+  SECCOM_DIR="$SRC/drivers/input/misc/oppo_seccommon_drivers"
+  SECCOM="$SECCOM_DIR/Makefile"
+  INMAKE="$SRC/drivers/input/Makefile"
+
+  # 1) 恢复子目录 Makefile（若本轮是全新 clone，直接写回原内容）
+  if [ -f "$SECCOM.u60bak" ]; then
+    cp -f "$SECCOM.u60bak" "$SECCOM"
+    RESTORE="从 .u60bak 恢复"
   else
-    step patch_oppo_seccommon SKIP "源码树无 oppo_seccommon_drivers/Makefile"
+    mkdir -p "$SECCOM_DIR"
+    printf 'obj-y        += oppo_secure_common/\n' > "$SECCOM"
+    RESTORE="写回原内容"
+  fi
+
+  # 2) 注释掉上层无条件引用
+  if [ -f "$INMAKE" ] && grep -qE '^obj-y[[:space:]]*\+=[[:space:]]*misc/oppo_seccommon_drivers/' "$INMAKE"; then
+    cp -f "$INMAKE" "$INMAKE.u60bak"
+    sed -i 's,^obj-y[[:space:]]*+=[[:space:]]*misc/oppo_seccommon_drivers/,# obj-y += misc/oppo_seccommon_drivers/,' "$INMAKE"
+    step patch_oppo_seccommon OK "上层引用已注释、子 Makefile $RESTORE（备份 .u60bak）"
+  elif [ -f "$INMAKE" ]; then
+    step patch_oppo_seccommon OK "上层引用已不存在；子 Makefile $RESTORE"
+  else
+    step patch_oppo_seccommon SKIP "源码树无 drivers/input/Makefile，无法摘除"
   fi
 
   if make O="$OUT" olddefconfig >"$LOGS/olddefconfig.log" 2>&1; then
