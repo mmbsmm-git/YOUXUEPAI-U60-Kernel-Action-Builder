@@ -14,7 +14,8 @@
 #
 # 设计原则：任何一步失败都只记录、不中断，最后一定产出报告。
 # v2：修补 imgsensor Makefile；make 目标改 vmlinux；AUTO 回退写死 sha。
-# v3：补齐 aarch64-linux-gnu-* binutils 别名，修 VDSO 汇编器错配。
+# v3：补齐 aarch64-linux-gnu-* binutils 别名（路径假设错误，见 v4）。
+# v4：全盘 find AOSP binutils 目录，双 triple 软链，apt 兜底。
 set -uo pipefail
 
 WS=/workspace
@@ -78,37 +79,83 @@ else
   step toolchain_verify FAIL "clang 不可执行，编译步骤大概率失败"
 fi
 
-# ---- 补齐两套 triple 的 binutils ----
-# 第二次跑暴露的真问题：4.4 内核 VDSO 用 clang -fno-integrated-as 调用
-#   $(CLANG_TRIPLE)as，也就是 aarch64-linux-gnu-as。容器里没装
-#   binutils-aarch64-linux-gnu，clang 就回退到宿主 x86 /usr/bin/as，
-#   于是 arch/arm64/kernel/vdso/gettimeofday.S 满屏
-#   "no such instruction: `adr`/`cbz`/`dmb`"，vmlinux 直接失败。
-# AOSP gcc 4.9 里的 aarch64-linux-android-as 就是 AArch64 GNU as，
-# 软链成 aarch64-linux-gnu-* 即可，不用重建镜像、不用换 IMAGE_TAG。
-SRC_BIN="$TC/aarch64-linux-android-4.9/bin"
+# ---- 补齐两套 triple 的 binutils（v4）----
+# 第三跑证明 v3 假设错了：AOSP prebuilts/gcc 仓库的 binutils 不在
+#   $TC/aarch64-linux-android-4.9/bin/ 下（那里只有 gcc/g++ driver），
+# 而是在 <triple>/bin/ 之类的子目录，文件名也可能不带 triple 前缀。
+# 结果 toolchain_gnu_as FAIL，VDSO 仍回退到 x86 as，满屏 no such instruction。
+#
+# v4 做三件事：
+#   1) 在整个 gcc 目录里 find 任意可用的 AArch64 as，定位 binutils 目录
+#   2) 把该目录里的工具同时软链成 aarch64-linux-gnu-*（CLANG_TRIPLE 用）
+#      和 aarch64-linux-android-*（CROSS_COMPILE 链接用），两套都齐
+#   3) 一个都找不到就 apt 装 binutils-aarch64-linux-gnu 兜底
+#      （容器默认 root，focal 有这个包；不用重建镜像、不用换 IMAGE_TAG）
+GCC_DIR="$TC/aarch64-linux-android-4.9"
 GNU_BIN="$TC/gnu-triple-bin"
-mkdir -p "$GNU_BIN" "$SRC_BIN"
-TOOLS="as ld ld.bfd objdump nm ar strip objcopy ranlib readelf size strings addr2line"
-N_LINK=0
-for t in $TOOLS; do
-  if [ -x "$SRC_BIN/aarch64-linux-android-$t" ]; then
-    ln -sf "$SRC_BIN/aarch64-linux-android-$t" "$GNU_BIN/aarch64-linux-gnu-$t"
-    N_LINK=$((N_LINK+1))
-  fi
+mkdir -p "$GNU_BIN"
+
+AS_BIN=""
+for pat in 'aarch64-linux-android-as' 'as'; do
+  AS_BIN=$(find "$GCC_DIR" -type f -name "$pat" -perm -u+x 2>/dev/null | head -1)
+  [ -n "$AS_BIN" ] && break
 done
-export PATH="$GNU_BIN:$PATH"
-if [ -x "$GNU_BIN/aarch64-linux-gnu-as" ]; then
-  step toolchain_gnu_as OK "补齐 $N_LINK 个 aarch64-linux-gnu-* 工具（VDSO 汇编用）"
+# 排除误抓到 x86 /usr/bin/as 的可能（find 只在 GCC_DIR 内，本身安全）
+BINUTILS_DIR=""
+[ -n "$AS_BIN" ] && BINUTILS_DIR=$(dirname "$AS_BIN")
+
+TOOLS="as ld ld.bfd ar nm objcopy objdump ranlib readelf strip size strings addr2line"
+N_LINK=0
+if [ -n "$BINUTILS_DIR" ]; then
+  for t in $TOOLS; do
+    src=""
+    for cand in "$BINUTILS_DIR/aarch64-linux-android-$t" "$BINUTILS_DIR/$t"; do
+      if [ -x "$cand" ]; then src="$cand"; break; fi
+    done
+    [ -z "$src" ] && continue
+    ln -sf "$src" "$GNU_BIN/aarch64-linux-gnu-$t"
+    ln -sf "$src" "$GNU_BIN/aarch64-linux-android-$t"
+    N_LINK=$((N_LINK+1))
+  done
+  step toolchain_binutils_src OK "AOSP binutils 目录：$BINUTILS_DIR，软链 $N_LINK 个工具"
 else
-  step toolchain_gnu_as FAIL "gcc4.9 缺 aarch64-linux-android-as；需在 Dockerfile 装 binutils-aarch64-linux-gnu"
+  step toolchain_binutils_src WARN "AOSP gcc 目录里没找到 as，改用 apt 兜底"
+fi
+
+# PATH 最前：软链目录 + AOSP 原始 binutils 目录（后者保证 CROSS_COMPILE 也能解析）
+export PATH="$GNU_BIN${BINUTILS_DIR:+:$BINUTILS_DIR}:$PATH"
+
+if ! command -v aarch64-linux-gnu-as >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    if apt-get update -qq >"$LOGS/apt_update.log" 2>&1 && \
+       apt-get install -y -qq binutils-aarch64-linux-gnu >>"$LOGS/apt_install.log" 2>&1; then
+      # Debian 那套只提供 aarch64-linux-gnu-*，给 CROSS_COMPILE 也补一份别名
+      for t in $TOOLS; do
+        if [ -x "/usr/bin/aarch64-linux-gnu-$t" ] && \
+           [ ! -e "$GNU_BIN/aarch64-linux-android-$t" ]; then
+          ln -sf "/usr/bin/aarch64-linux-gnu-$t" "$GNU_BIN/aarch64-linux-android-$t"
+        fi
+      done
+      step toolchain_apt_binutils OK "apt 安装 binutils-aarch64-linux-gnu 兜底成功"
+    else
+      step toolchain_apt_binutils FAIL "apt 装不上，见 apt_*.log；需改 Dockerfile 并换 IMAGE_TAG 重建镜像"
+    fi
+  else
+    step toolchain_apt_binutils SKIP "容器内无 apt-get"
+  fi
+fi
+
+if command -v aarch64-linux-gnu-as >/dev/null 2>&1; then
+  step toolchain_gnu_as OK "$(aarch64-linux-gnu-as --version 2>&1 | head -1)"
+else
+  step toolchain_gnu_as FAIL "仍无 aarch64-linux-gnu-as；VDSO 必定回退 x86 as"
 fi
 
 # CROSS_COMPILE 那套也补 objdump（mk_elfconfig 只读 ELF 头，宿主 objdump 够用）
 if ! command -v aarch64-linux-android-objdump >/dev/null 2>&1; then
   SYSOBJ=$(command -v objdump || true)
   if [ -n "$SYSOBJ" ]; then
-    ln -sf "$SYSOBJ" "$SRC_BIN/aarch64-linux-android-objdump"
+    ln -sf "$SYSOBJ" "$GNU_BIN/aarch64-linux-android-objdump"
     step toolchain_objdump OK "用系统 objdump 补齐"
   else
     step toolchain_objdump SKIP "无 objdump，非致命"
