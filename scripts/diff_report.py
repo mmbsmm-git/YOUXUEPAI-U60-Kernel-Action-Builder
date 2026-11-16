@@ -173,6 +173,31 @@ compat_miss = sorted(base_compat - src_compat)
 yxp_list = [l.split()[-1] for l in readlines(P(B, 'yxp_private_syms.txt')) if l.startswith('0')]
 hw_text = readtext(P(B, 'board_hardware.txt'))
 
+# ---------------------------------------------------------------- 配置 diff
+# 用编译产物 autoconf.h 反查 u60.config：本机开了、但这棵树的 Kconfig 里
+# 根本不存在的选项，就是「板级功能缺口」的精确清单（比数 compatible 更准）。
+def parse_config(path):
+    d = {}
+    for line in readlines(path):
+        m = re.match(r'(CONFIG_[A-Za-z0-9_]+)=(.*)$', line.strip())
+        if m:
+            d[m.group(1)] = m.group(2)
+    return d
+
+
+def parse_autoconf(path):
+    return set(re.findall(r'^#define\s+(CONFIG_[A-Za-z0-9_]+)\b',
+                          readtext(path), re.M))
+
+
+cfg_base = parse_config(P(B, 'u60.config'))
+cfg_hdr = parse_autoconf(P(O, 'artifacts', 'autoconf.h'))
+# tristate =m 在 autoconf.h 里是 CONFIG_X_MODULE，不算丢失
+cfg_lost = [k for k in sorted(cfg_base)
+            if k not in cfg_hdr and k + '_MODULE' not in cfg_hdr]
+cfg_extra = [k for k in sorted(cfg_hdr)
+             if k not in cfg_base and not k.endswith('_MODULE')]
+
 # ---------------------------------------------------------------- 编译日志
 build_log = readtext(P(L, 'build.log'))
 build_errs = [x for x in build_log.splitlines()
@@ -307,7 +332,34 @@ md.append('```')
 md.append(hw_text.strip()[:1000])
 md.append('```')
 md.append('')
-md.append('## 5. 编译日志摘要')
+md.append('## 5. 配置 diff（olddefconfig 静默丢掉的本机选项）')
+md.append('')
+if cfg_hdr:
+    md.append('本机 `u60.config` 显式设置 **%d** 项，编译生成的 `autoconf.h` 定义 '
+              '**%d** 项。其中 **%d** 项在这棵树的 Kconfig 里不存在，被 '
+              '`olddefconfig` 无声删除；另有 **%d** 项是这棵树自带的选项。'
+              % (len(cfg_base), len(cfg_hdr), len(cfg_lost), len(cfg_extra)))
+    md.append('')
+    md.append('| 功能 | 丢弃项 |')
+    md.append('|---|---|')
+    CAT = [
+        ('触摸（GT9271 / HX83102 / ELAN）', ['GTP_', 'GT9271', 'HIMAX', 'TOUCHSCREEN']),
+        ('传感器（霍尔 / 加速度 / 光距）', ['HALL_', 'MTK_AP322', 'MTK_BMA', 'MTK_CS503']),
+        ('语音唤醒（DBMDX）', ['DBMDX']),
+        ('摄像头 EEPROM', ['EEPROM_CAM']),
+        ('其他（安全/无关 erratum）', ['HARDEN_', 'QCOM_', 'TCP_CONG', 'USB_GSPCA', 'GATOR']),
+    ]
+    for name, keys in CAT:
+        hit = [k for k in cfg_lost if any(x in k for x in keys)]
+        if hit:
+            md.append('| %s | %d：%s |' % (name, len(hit), ', '.join('`%s`' % x for x in hit)))
+    md.append('')
+    md.append('树里新增（OPPO/360 定制）：%s' %
+              (', '.join('`%s`' % x for x in cfg_extra) or '无'))
+else:
+    md.append('未执行（需要 `out/artifacts/autoconf.h`）。')
+md.append('')
+md.append('## 6. 编译日志摘要')
 md.append('')
 if build_errs:
     md.append('```')
@@ -344,6 +396,7 @@ sm = ['## U60 内核源码核对',
       '| CRC 一致 | %s |' % ('%d / %d' % (crc_ok_n, len(crc_rows)) if crc_rows else '未执行'),
       '| 符号 diff | %s |' % ('源码 %d / 本机 %d' % (len(src_syms), len(base_syms)) if src_syms else '未执行'),
       '| dts compatible 命中 | %d / %d |' % (len(compat_hit), len(base_compat)),
+      '| 配置丢弃项 | %d |' % len(cfg_lost),
       '']
 for v in verdicts:
     sm.append('- ' + v)
@@ -369,6 +422,8 @@ with open(P(O, 'summary.json'), 'w', encoding='utf-8') as f:
         'sym_missing': len(sym_missing),
         'sym_extra': len(sym_extra),
         'compat_hit': len(compat_hit),
+        'config_lost': cfg_lost,
+        'config_extra': cfg_extra,
         'compat_missing': compat_miss[:60],
         'steps': [{'name': n, 'status': st, 'msg': m} for n, st, m in steps],
     }, f, ensure_ascii=False, indent=2)

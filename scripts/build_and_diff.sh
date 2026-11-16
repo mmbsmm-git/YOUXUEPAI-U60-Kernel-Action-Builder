@@ -13,7 +13,8 @@
 #   AARCH64_GCC_URL / ARM32_GCC_URL   gcc 4.9 仓库地址
 #
 # 设计原则：任何一步失败都只记录、不中断，最后一定产出报告。
-# v2：修补 OEM 树缺失的 imgsensor Makefile；make 目标改 vmlinux；AUTO 回退写死已验证 sha。
+# v2：修补 imgsensor Makefile；make 目标改 vmlinux；AUTO 回退写死 sha。
+# v3：补齐 aarch64-linux-gnu-* binutils 别名，修 VDSO 汇编器错配。
 set -uo pipefail
 
 WS=/workspace
@@ -77,14 +78,43 @@ else
   step toolchain_verify FAIL "clang 不可执行，编译步骤大概率失败"
 fi
 
-# gcc 4.9 仓库有时不带 aarch64-linux-android-objdump（首跑报 not found，非致命），
-# 用宿主 GNU objdump 建个软链，避免 scripts/mod/mk_elfconfig 再报错。
+# ---- 补齐两套 triple 的 binutils ----
+# 第二次跑暴露的真问题：4.4 内核 VDSO 用 clang -fno-integrated-as 调用
+#   $(CLANG_TRIPLE)as，也就是 aarch64-linux-gnu-as。容器里没装
+#   binutils-aarch64-linux-gnu，clang 就回退到宿主 x86 /usr/bin/as，
+#   于是 arch/arm64/kernel/vdso/gettimeofday.S 满屏
+#   "no such instruction: `adr`/`cbz`/`dmb`"，vmlinux 直接失败。
+# AOSP gcc 4.9 里的 aarch64-linux-android-as 就是 AArch64 GNU as，
+# 软链成 aarch64-linux-gnu-* 即可，不用重建镜像、不用换 IMAGE_TAG。
+SRC_BIN="$TC/aarch64-linux-android-4.9/bin"
+GNU_BIN="$TC/gnu-triple-bin"
+mkdir -p "$GNU_BIN" "$SRC_BIN"
+TOOLS="as ld ld.bfd objdump nm ar strip objcopy ranlib readelf size strings addr2line"
+N_LINK=0
+for t in $TOOLS; do
+  if [ -x "$SRC_BIN/aarch64-linux-android-$t" ]; then
+    ln -sf "$SRC_BIN/aarch64-linux-android-$t" "$GNU_BIN/aarch64-linux-gnu-$t"
+    N_LINK=$((N_LINK+1))
+  fi
+done
+export PATH="$GNU_BIN:$PATH"
+if [ -x "$GNU_BIN/aarch64-linux-gnu-as" ]; then
+  step toolchain_gnu_as OK "补齐 $N_LINK 个 aarch64-linux-gnu-* 工具（VDSO 汇编用）"
+else
+  step toolchain_gnu_as FAIL "gcc4.9 缺 aarch64-linux-android-as；需在 Dockerfile 装 binutils-aarch64-linux-gnu"
+fi
+
+# CROSS_COMPILE 那套也补 objdump（mk_elfconfig 只读 ELF 头，宿主 objdump 够用）
 if ! command -v aarch64-linux-android-objdump >/dev/null 2>&1; then
   SYSOBJ=$(command -v objdump || true)
   if [ -n "$SYSOBJ" ]; then
-    ln -sf "$SYSOBJ" "$TC/aarch64-linux-android-4.9/bin/aarch64-linux-android-objdump"
+    ln -sf "$SYSOBJ" "$SRC_BIN/aarch64-linux-android-objdump"
     step toolchain_objdump OK "用系统 objdump 补齐"
+  else
+    step toolchain_objdump SKIP "无 objdump，非致命"
   fi
+else
+  step toolchain_objdump OK "已存在"
 fi
 
 ###############################################################################
