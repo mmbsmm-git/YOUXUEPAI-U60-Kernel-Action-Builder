@@ -20,6 +20,7 @@
 # v6：改为从 drivers/input/Makefile 摘除目录引用（置空子 Makefile 会缺 built-in.o）。
 # v7：处理 U60 专属选料在 OEM 树里的三处残留（qpnp 头 / LCM 空列表断言 / imgsensor 名）。
 # v8：摘除 lcm/Makefile 把 string CONFIG 当子目录的那行（第七跑唯一残留）。
+# v9：modpost 的 12 处 section mismatch 降级为警告，让 vmlinux 链接完成。
 set -uo pipefail
 
 WS=/workspace
@@ -296,6 +297,15 @@ else
   cd "$SRC"
   mkdir -p "$OUT"
   cp "$BASE/u60.config" "$OUT/.config"
+  # v9：modpost 把 12 处 section mismatch 当 FATAL（Makefile.modpost:80
+  #   $(if $(CONFIG_SECTION_MISMATCH_WARN_ONLY),,-E)  -> 不设就传 -E）。
+  # 这些是 OEM 树里 __init 引用 __devinit 之类的历史遗留，不影响生成的
+  # 内核功能，但会挡住 vmlinux 链接，导致 nm 符号 diff 跑不了。
+  # 日志自己也提示：Set CONFIG_SECTION_MISMATCH_WARN_ONLY=y to allow them.
+  # 双保险：写进 .config + 两次 make 命令行都传（命令行变量优先级最高）。
+  if ! grep -q '^CONFIG_SECTION_MISMATCH_WARN_ONLY=y' "$OUT/.config"; then
+    printf 'CONFIG_SECTION_MISMATCH_WARN_ONLY=y\n' >> "$OUT/.config"
+  fi
 
   # ---- U60 专属选料 vs Realme/OPPO 树（v7，第六跑的三个独立错误）----
   # v6 摘掉 oppo_seccommon 后编译推进到 drivers/，make -j 同时暴露三处：
@@ -494,6 +504,8 @@ else:
     step patch_oppo_seccommon SKIP "源码树无 drivers/input/Makefile，无法摘除"
   fi
 
+  step patch_modpost_warn OK "section mismatch 降级为警告（WARN_ONLY=y）"
+
   if make O="$OUT" olddefconfig >"$LOGS/olddefconfig.log" 2>&1; then
     step olddefconfig OK "以 u60.config 为基线生成 .config"
   else
@@ -504,11 +516,11 @@ else:
   # 目标只取 vmlinux：默认 all 会先跑 drivers/modules.builtin，
   # 对裁剪过的 OEM 树很脆弱；vmlinux 链接时 modpost 仍会生成 Module.symvers，
   # CRC 比对需要的就是它。
-  if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" TARGET_PRODUCT=full_oppo6771 vmlinux \
+  if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" TARGET_PRODUCT=full_oppo6771 CONFIG_SECTION_MISMATCH_WARN_ONLY=y vmlinux \
        2>&1 | tee "$LOGS/build.log"; then
     step build OK "vmlinux 编译完成（已跳过 modules.builtin）"
     # 再补一个可刷的 Image.gz-dtb；失败不致命，不影响 CRC/符号比对
-    if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" TARGET_PRODUCT=full_oppo6771 Image.gz-dtb \
+    if make O="$OUT" -j"$(nproc --all)" CC=clang REAL_CC="$REAL_CC" TARGET_PRODUCT=full_oppo6771 CONFIG_SECTION_MISMATCH_WARN_ONLY=y Image.gz-dtb \
          >>"$LOGS/build.log" 2>&1; then
       step image_gz_dtb OK "Image.gz-dtb 已生成"
     else
