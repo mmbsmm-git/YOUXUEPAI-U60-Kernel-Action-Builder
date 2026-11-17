@@ -18,6 +18,7 @@
 # v4：全盘 find AOSP binutils 目录，双 triple 软链，apt 兜底。
 # v5：隔离 OPPO 高通残留驱动 + 传 TARGET_PRODUCT=full_oppo6771。
 # v6：改为从 drivers/input/Makefile 摘除目录引用（置空子 Makefile 会缺 built-in.o）。
+# v7：处理 U60 专属选料在 OEM 树里的三处残留（qpnp 头 / LCM 空列表断言 / imgsensor 名）。
 set -uo pipefail
 
 WS=/workspace
@@ -294,6 +295,82 @@ else
   cd "$SRC"
   mkdir -p "$OUT"
   cp "$BASE/u60.config" "$OUT/.config"
+
+  # ---- U60 专属选料 vs Realme/OPPO 树（v7，第六跑的三个独立错误）----
+  # v6 摘掉 oppo_seccommon 后编译推进到 drivers/，make -j 同时暴露三处：
+  #
+  # (a) drivers/power/oppo/oppo_charger.h:46
+  #       fatal error: 'linux/qpnp/qpnp-adc.h' file not found
+  #     charger/Makefile 把 oppo_mt6771_charger.o 挂在 CONFIG_MTK_SMART_BATTERY=y
+  #     下（u60.config 开着）。oppo_charger.h 靠 CONFIG_OPPO_CHARGER_MTK 分叉，
+  #     未定义就走高通 #else 分支 include qpnp/qpnp-adc.h —— 又一个高通残留。
+  #     这棵树是 MT6771，给 charger 子目录补 -D 走 MTK 分支即可，不改 CONFIG。
+  CHG="$SRC/drivers/power/mediatek/charger/Makefile"
+  if [ -f "$CHG" ] && ! grep -q 'U60_MTK_CHARGER_BRANCH' "$CHG"; then
+    cp -f "$CHG" "$CHG.u60bak"
+    printf '\n# U60_MTK_CHARGER_BRANCH: force MTK branch (avoid qcom qpnp-adc.h)\nsubdir-ccflags-y += -DCONFIG_OPPO_CHARGER_MTK\n' >> "$CHG"
+    step patch_oppo_charger OK "追加 -DCONFIG_OPPO_CHARGER_MTK"
+  else
+    step patch_oppo_charger SKIP "已处理或无该文件"
+  fi
+
+  # (b) drivers/misc/mediatek/lcm/mt65xx_lcm_list.c:1289
+  #       'assertion_failed_at_line_1289' declared as an array with a negative size
+  #     CONFIG_CUSTOM_KERNEL_LCM="dg10132004_40c_wuxga_dsi_vdo" 是 U60 的屏，
+  #     这棵树的 lcm_driver_list 里没有任何对应 #if 分支 -> 列表为空 ->
+  #     LCM_COMPILE_ASSERT 失败。U60 的 nt35595+ssd2858 面板驱动本来就不在
+  #     OEM 树里（后续移植项），先关掉编译期检查让编译走完。
+  #     断言生成的只是文件内静态 char 数组，注释掉不影响 Module.symvers。
+  LCMLIST="$SRC/drivers/misc/mediatek/lcm/mt65xx_lcm_list.c"
+  if [ -f "$LCMLIST" ]; then
+    python3 -c "
+import sys
+p='$LCMLIST'
+s=open(p,encoding='utf-8',errors='replace').read()
+t='LCM_COMPILE_ASSERT(sizeof(lcm_driver_list) / sizeof(LCM_DRIVER *) != 0);'
+if t in s and 'U60 assert disabled' not in s:
+    open(p,'w',encoding='utf-8').write(s.replace(t,'/* U60 assert disabled: empty lcm list */'))
+    print(' patched')
+else:
+    print(' skip')
+" >"$LOGS/patch_lcm_assert.log" 2>&1
+    step patch_lcm_assert OK "$(cat "$LOGS/patch_lcm_assert.log" | xargs)"
+  else
+    step patch_lcm_assert SKIP "源码树无 mt65xx_lcm_list.c"
+  fi
+
+  # (c) .../common/v1_1/s5k3l6jk_mipi_raw/Makefile: No such file or directory
+  #     CONFIG_CUSTOM_KERNEL_IMGSENSOR 里 8 个名字，其中 5 个是 U60 专属
+  #     （s5k3l6jk / s5k5e9dc / s5k4h7yx_*），common/v1_1 里没有对应目录。
+  #     mt6771/Makefile 的 FILTER_DRV 会把它们当 common_drv 加进 obj-y，
+  #     kbuild 找不到 Makefile 就 Stop；同时 src/Makefile 把同一串名字
+  #     tr a-z A-Z 生成 -D 宏，imgsensor_sensor_list.c 会引用不存在的
+  #     SensorInit / SENSOR_DRVNAME。两边同源，一处收敛即可。
+  CFG="$OUT/.config"
+  if [ -f "$CFG" ]; then
+    CUR=$(sed -n 's/^CONFIG_CUSTOM_KERNEL_IMGSENSOR="\(.*\)"$/\1/p' "$CFG" | head -1)
+    ISRC="$SRC/drivers/misc/mediatek/imgsensor/src"
+    PROJ=$(sed -n 's/^CONFIG_ARCH_MTK_PROJECT="\(.*\)"$/\1/p' "$CFG" | head -1)
+    [ -z "$PROJ" ] && PROJ="k71v1_64_bsp"
+    KEEP=""; DROP=""
+    for d in $CUR; do
+      if [ -d "$ISRC/common/v1_1/$d" ] || [ -d "$ISRC/mt6771/$d" ] || \
+         [ -d "$ISRC/mt6771/camera_project/$PROJ/$d" ]; then
+        KEEP="$KEEP $d"
+      else
+        DROP="$DROP $d"
+      fi
+    done
+    KEEP=$(echo "$KEEP" | xargs)
+    if [ -n "$CUR" ] && [ "$KEEP" != "$CUR" ]; then
+      sed -i "s|^CONFIG_CUSTOM_KERNEL_IMGSENSOR=\".*\"$|CONFIG_CUSTOM_KERNEL_IMGSENSOR=\"$KEEP\"|" "$CFG"
+      step patch_imgsensor_cfg OK "收敛为树内 sensor：$KEEP（剔除：$DROP）"
+    else
+      step patch_imgsensor_cfg OK "全部 sensor 均在树内，无需收敛"
+    fi
+  else
+    step patch_imgsensor_cfg SKIP "无 .config"
+  fi
   export ARCH=arm64 SUBARCH=arm64
   export CROSS_COMPILE=aarch64-linux-android-
   export CROSS_COMPILE_ARM32=arm-linux-androideabi-
