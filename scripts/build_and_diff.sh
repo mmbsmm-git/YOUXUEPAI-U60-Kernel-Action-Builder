@@ -307,6 +307,41 @@ else
     printf 'CONFIG_SECTION_MISMATCH_WARN_ONLY=y\n' >> "$OUT/.config"
   fi
 
+  # ---- v10：关掉 OEM 树自带的 13 项定制配置（做 CONFIG 污染 vs 源码差异 分离实验）----
+  # 第八跑：autoconf.h 相对 u60.config 多出 13 项，全是 OPPO / 360 定制默认值。
+  # 其中 CONFIG_IMQ_MODULE 直接给 struct sk_buff 加了 cb_next / nf_queue_entry /
+  # imq_flags 三个字段，而原厂 config 根本没有 IMQ —— genksyms 递归展开结构体，
+  # 于是 skb / netlink / cfg80211 / genl 相关导出符号 CRC 集体变化（189 项 MISMATCH）。
+  #
+  # 注意 _MODULE 是模块形式，.config 里对应的是主符号 CONFIG_IMQ=m，
+  # 所以这里关的是主符号，不是 autoconf.h 里那个名字。IMQ_NUM_DEVS 依赖 IMQ，
+  # IMQ 关掉后它自动消失，不用单独写。
+  POLLUTION_OFF="CONFIG_IMQ CONFIG_NETFILTER_XT_TARGET_IMQ CONFIG_XT_QTAGUID_OPPO_STATS \
+                 CONFIG_QIHOO CONFIG_QIHOO_KERNEL_CHECK CONFIG_QIHOO_SIGN_CHECK \
+                 CONFIG_QIHOO_USE_KERNEL_FRAME CONFIG_GATOR CONFIG_TCP_CONG_HTCP \
+                 CONFIG_TCP_CONG_WESTWOOD CONFIG_USB_GSPCA CONFIG_OPPO_KEVENT_UPLOAD"
+  for k in $POLLUTION_OFF; do
+    sed -i "s|^${k}=.*$|# ${k} is not set|" "$OUT/.config"
+    grep -q "^# ${k} is not set" "$OUT/.config" || printf '# %s is not set\n' "$k" >> "$OUT/.config"
+  done
+
+  # 上面 .config 能关掉「有 prompt」的项；但 arch/arm64/Kconfig 里
+  #   config OPPO_KEVENT_UPLOAD / def_bool y
+  # 是无 prompt 的 def_bool，oldconfig/silentoldconfig 会强制拉回 y，
+  # .config 写 is not set 没用。必须把 Kconfig 默认值改成 n。
+  # drivers/qihoo/Kconfig 整份都是 360 定制（menuconfig QIHOO + 三个子项都 default y），
+  # 一起把 default/def_bool y 改成 n，双保险。这两处改的是「构建配置层」，不动内核代码，
+  # 语义上仍属于「关配置」，不会影响 CRC 归因。
+  if [ -f "$SRC/drivers/qihoo/Kconfig" ]; then
+    sed -i -E 's/^([[:space:]]*)(default|def_bool)[[:space:]]+y([[:space:]]*)$/\1\2 n\3/' \
+      "$SRC/drivers/qihoo/Kconfig"
+  fi
+  if [ -f "$SRC/arch/arm64/Kconfig" ] && grep -q '^config OPPO_KEVENT_UPLOAD' "$SRC/arch/arm64/Kconfig"; then
+    awk '/^config OPPO_KEVENT_UPLOAD$/{f=1} f && /def_bool y/{sub(/def_bool y/,"def_bool n"); f=0} {print}' \
+      "$SRC/arch/arm64/Kconfig" > "$SRC/arch/arm64/Kconfig.u60tmp" \
+      && mv "$SRC/arch/arm64/Kconfig.u60tmp" "$SRC/arch/arm64/Kconfig"
+  fi
+
   # ---- U60 专属选料 vs Realme/OPPO 树（v7，第六跑的三个独立错误）----
   # v6 摘掉 oppo_seccommon 后编译推进到 drivers/，make -j 同时暴露三处：
   #
@@ -511,6 +546,14 @@ else:
   else
     step olddefconfig FAIL "见 olddefconfig.log"
   fi
+
+  # 验证：把最终 autoconf.h 里所有污染项残留 dump 出来。
+  # 空文件 / 只剩 IMQ_NUM_DEVS 这种无关数值项 = 关干净了；
+  # 若还出现 CONFIG_OPPO_KEVENT_UPLOAD 之类，说明 Kconfig 兜底没生效，日志一眼可见。
+  grep -E '^#define[[:space:]]+CONFIG_(IMQ|NETFILTER_XT_TARGET_IMQ|IMQ_NUM_DEVS|OPPO_KEVENT_UPLOAD|QIHOO|QIHOO_KERNEL_CHECK|QIHOO_SIGN_CHECK|QIHOO_USE_KERNEL_FRAME|XT_QTAGUID_OPPO_STATS|GATOR|TCP_CONG_HTCP|TCP_CONG_WESTWOOD|USB_GSPCA)' \
+    "$OUT/include/generated/autoconf.h" > "$LOGS/pollution_check.txt" 2>/dev/null || true
+  PLEFT=$(wc -l < "$LOGS/pollution_check.txt" 2>/dev/null || echo 0)
+  step patch_pollution_off OK "13 项定制配置已关闭；autoconf.h 残留 $PLEFT 行（见 pollution_check.txt）"
 
   # CC / REAL_CC 都给：MTK 4.4 的老 Makefile 有的只认 REAL_CC。
   # 目标只取 vmlinux：默认 all 会先跑 drivers/modules.builtin，
