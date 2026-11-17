@@ -19,6 +19,7 @@
 # v5：隔离 OPPO 高通残留驱动 + 传 TARGET_PRODUCT=full_oppo6771。
 # v6：改为从 drivers/input/Makefile 摘除目录引用（置空子 Makefile 会缺 built-in.o）。
 # v7：处理 U60 专属选料在 OEM 树里的三处残留（qpnp 头 / LCM 空列表断言 / imgsensor 名）。
+# v8：摘除 lcm/Makefile 把 string CONFIG 当子目录的那行（第七跑唯一残留）。
 set -uo pipefail
 
 WS=/workspace
@@ -338,6 +339,43 @@ else:
   else
     step patch_lcm_assert SKIP "源码树无 mt65xx_lcm_list.c"
   fi
+
+  # (b2) lcm/Makefile:26 —— 第七跑唯一残留
+  #     obj-$(CONFIG_MTK_LCM) += $(foreach LCM,$(LCM_LISTS),$(LCM)/)
+  #   LCM_LISTS := $(subst ",,$(CONFIG_CUSTOM_KERNEL_LCM))
+  #   U60 的值是 dg10132004_40c_wuxga_dsi_vdo，树里没有这个目录
+  #   -> kbuild 找 <lcm>/dg10132004_40c_wuxga_dsi_vdo/Makefile 失败 -> Stop。
+  #   这和 imgsensor 是同一类问题（string 型 CONFIG 被当子目录路径），
+  #   只是 LCM 有两个消费点：v7 处理了断言（列表为空），这里处理目录引用。
+  #   注释掉该行后：不引用不存在的目录，LCM_DEFINES 仍生成 -D 宏但无害，
+  #   mt65xx_lcm_list.c 列表为空、断言已被 v7 注释 -> 编译放行。
+  #   U60 的 nt35595+ssd2858 面板驱动本就不在 OEM 树里（后续移植项）。
+  LCMMK="$SRC/drivers/misc/mediatek/lcm/Makefile"
+  if [ -f "$LCMMK" ]; then
+    python3 -c "
+p='$LCMMK'
+s=open(p,encoding='utf-8',errors='replace').read()
+t='obj-\$(CONFIG_MTK_LCM) += \$(foreach LCM,\$(LCM_LISTS),\$(LCM)/)'
+if t in s and 'U60_LCM_SUBDIR_DISABLED' not in s:
+    s=s.replace(t,'# U60_LCM_SUBDIR_DISABLED: no matching LCM dir in OEM tree\n# '+t)
+    open(p,'w',encoding='utf-8').write(s)
+    print('patched')
+else:
+    print('skip')
+" >"$LOGS/patch_lcm_subdir.log" 2>&1
+    step patch_lcm_subdir OK "$(cat "$LOGS/patch_lcm_subdir.log" | xargs)"
+  else
+    step patch_lcm_subdir SKIP "源码树无 lcm/Makefile"
+  fi
+
+  # 通用预检：把 CONFIG_CUSTOM_KERNEL_* 当目录路径用的 Makefile 行全部列出来。
+  # MTK 4.4 里这类 string 配置是唯一会「按名字找目录」的机制，
+  # imgsensor 和 lcm 已处理；这里把剩余点一次性记进 steps，避免再出 v9。
+  grep -rnE '\$\(CONFIG_CUSTOM_KERNEL_[A-Z_]+\).*/|\$\(foreach.*CONFIG_CUSTOM_KERNEL' \
+      "$SRC/drivers" --include=Makefile 2>/dev/null \
+      | grep -v 'U60_LCM_SUBDIR_DISABLED' > "$LOGS/string_cfg_paths.txt" || true
+  N=$(wc -l < "$LOGS/string_cfg_paths.txt" 2>/dev/null || echo 0)
+  step precheck_string_cfg_paths OK "剩余 string-CONFIG 目录引用 $N 行（见 string_cfg_paths.txt）"
 
   # (c) .../common/v1_1/s5k3l6jk_mipi_raw/Makefile: No such file or directory
   #     CONFIG_CUSTOM_KERNEL_IMGSENSOR 里 8 个名字，其中 5 个是 U60 专属
