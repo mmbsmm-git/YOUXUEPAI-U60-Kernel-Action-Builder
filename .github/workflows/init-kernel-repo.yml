@@ -1,0 +1,114 @@
+name: 初始化 U60 内核源码仓库（一次性）
+
+# 用途：在 CI 里把通用 ALPS 基线的某一次提交，原样推成一个全新的、
+#       只有单个 commit、不带任何旧历史的源码仓库。
+# 之后所有适配 / 驱动 / 符号 / dts 都作为 commit 提交到那个仓库；
+# 编译仓库不再打任何补丁。
+
+on:
+  workflow_dispatch:
+    inputs:
+      NEW_REPO:
+        description: '新建的空仓库，格式 owner/repo（三个初始化选项都别勾）'
+        required: true
+        default: 'mmbsmm-git/YOUXUEPAI_U60_Kernel'
+      BASE_REPO:
+        description: '基线内核仓库 URL'
+        required: true
+        default: 'https://github.com/techyminati/alps-4.4'
+      BASE_SHA:
+        description: '基线 commit（alps-p_release / Linux 4.4.146）'
+        required: true
+        default: '5a1d479bfb0414eada1fba1f7d12ea14c737486d'
+      BASE_BRANCH:
+        description: '基线分支名（仅作记录，实际按 sha 定点取）'
+        required: true
+        default: 'alps-p_release'
+      PAT:
+        description: '备用：若未设置 secret KERNEL_REPO_PAT，在这里粘 classic repo PAT'
+        required: false
+        default: ''
+
+jobs:
+  init:
+    name: 定点取基线 → 干净单 commit → push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+    - name: 显示参数
+      run: |
+        echo "NEW_REPO   : ${{ github.event.inputs.NEW_REPO }}"
+        echo "BASE_REPO  : ${{ github.event.inputs.BASE_REPO }}"
+        echo "BASE_SHA   : ${{ github.event.inputs.BASE_SHA }}"
+        echo "BASE_BRANCH: ${{ github.event.inputs.BASE_BRANCH }}"
+
+    # 推到「另一个仓库」不能用 GITHUB_TOKEN（权限只覆盖本仓库），
+    # 需要在本仓库 Settings → Secrets 里加一个 classic repo PAT。
+    - name: 校验 secret 与空仓库
+      env:
+        PAT: ${{ secrets.KERNEL_REPO_PAT || github.event.inputs.PAT }}
+        NEW_REPO: ${{ github.event.inputs.NEW_REPO }}
+      run: |
+        set -e
+        if [ -z "$PAT" ]; then
+          echo "::error::缺少 PAT。请在 Run workflow 的 PAT 输入框粘贴，或设置 secret KERNEL_REPO_PAT。"
+          exit 1
+        fi
+        URL="https://x-access-token:$PAT@github.com/$NEW_REPO.git"
+        if ! git ls-remote "$URL" >/dev/null 2>&1; then
+          echo "::error::无法访问目标仓库。检查：仓库是否已创建、PAT 是否勾选 repo、owner/repo 是否写对。"
+          exit 1
+        fi
+        REFS=$(git ls-remote "$URL" 2>/dev/null | wc -l)
+        if [ "$REFS" -ne 0 ]; then
+          echo "::error::目标仓库非空（$REFS 个 ref），拒绝覆盖。请新建一个完全空的仓库，三个初始化选项都别勾。"
+          exit 1
+        fi
+        echo "✅ 目标仓库为空，可以写入"
+
+    - name: 取基线并推成干净单 commit
+      env:
+        PAT: ${{ secrets.KERNEL_REPO_PAT || github.event.inputs.PAT }}
+        NEW_REPO: ${{ github.event.inputs.NEW_REPO }}
+        BASE_REPO: ${{ github.event.inputs.BASE_REPO }}
+        BASE_SHA: ${{ github.event.inputs.BASE_SHA }}
+      run: |
+        set -e
+        mkdir -p work && cd work
+        git init -q
+        git config user.name  "U60 Kernel Builder"
+        git config user.email "u60-kernel@users.noreply.github.com"
+        git remote add upstream "$BASE_REPO"
+
+        # 定点取单个提交：depth=1 会把父指针截断，
+        # 推到新仓库后就是一个无父的 root commit，天然没有旧历史。
+        git fetch --depth=1 upstream "$BASE_SHA"
+        git checkout -q -b main FETCH_HEAD
+        git remote remove upstream
+
+        echo "=== 基线信息 ==="
+        git log -1 --format='  commit : %H%n  date   : %ad%n  subject: %s' --date=short
+        echo "  文件数 : $(git ls-files | wc -l)"
+        echo "  commit 总数 : $(git rev-list --count HEAD)   ← 必须为 1"
+        test "$(git rev-list --count HEAD)" -eq 1
+        echo "  Makefile 版本 : $(sed -n '1,5p' Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL' | tr '\n' ' ')"
+        echo "  k71v1_64_bsp 板级 : $(git ls-files | grep -c 'k71v1_64_bsp' || true) 个文件"
+
+        git remote add origin "https://x-access-token:$PAT@github.com/$NEW_REPO.git"
+        git push -u origin main
+        echo "✅ 已推送到 https://github.com/$NEW_REPO （单 commit、无旧历史）"
+
+    - name: 写 Step Summary
+      run: |
+        {
+          echo "## 内核源码仓库已初始化"
+          echo
+          echo "- 仓库：\`${{ github.event.inputs.NEW_REPO }}\`"
+          echo "- 基线：\`${{ github.event.inputs.BASE_REPO }}\` @ \`${{ github.event.inputs.BASE_SHA }}\`"
+          echo "- 历史：单个 commit，无旧记录"
+          echo
+          echo "下一步：去 Actions 跑 **U60 基线内核编译（纯编译）**，目标只有 \`build OK\`。"
+        } >> "$GITHUB_STEP_SUMMARY"
